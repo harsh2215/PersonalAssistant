@@ -1,0 +1,3 @@
+# data/
+# SQLite database (personalassistant.db) and per-user OAuth token files
+# are written here at runtime. All contents are gitignored.

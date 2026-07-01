@@ -1,0 +1,25 @@
+# Environment
+.env
+
+# SQLite database
+data/*.db
+
+# Google credentials and per-user OAuth tokens
+config/google_credentials.json
+data/*token*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
