@@ -10,7 +10,7 @@ Start order:
   6. Hand off to discord_listener.client.run() — blocks until Ctrl+C.
 
 Scheduler triggers:
-  - stocks_monitor.run   : cron, Mon-Fri, :00 and :30, hours 9–15 IST.
+  - stocks_monitor.run   : cron, Mon-Fri, :00 and :30, hours 9-15 IST.
     The monitor itself gates on is_market_open(), so stray scheduler
     ticks (e.g. at exactly 15:30) simply return early.
   - calendar_monitor.run : interval, every 3 hours.
