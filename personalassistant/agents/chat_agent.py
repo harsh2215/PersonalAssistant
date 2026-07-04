@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 _API_KEY    = os.environ.get("GEMINI_API_KEY", "")
-_MODEL_NAME = "gemini-2.5-flash"
+_MODEL_NAME = "gemini-3.1-flash-lite"
 
 # Initialize Client
 client = None

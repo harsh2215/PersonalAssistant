@@ -19,7 +19,7 @@ Threading model:
     The bot runs its asyncio event loop on the main thread (or whichever
     thread calls client.run()).  chat_agent.ask() makes blocking Gemini
     API calls, so it is dispatched via asyncio.to_thread() to avoid
-    stalling the event loop while waiting for Claude.
+    stalling the event loop while waiting for Gemini.
 
 Error handling:
     - Unknown user → brief "not registered" reply, no further processing.
