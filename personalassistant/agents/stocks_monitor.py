@@ -9,12 +9,13 @@ Entry point:
 Market-hours gate:
     is_market_open() is called at the top of run(). If the market is
     closed (outside Mon–Fri 09:15–15:30 IST) the function logs and
-    returns immediately without touching yfinance.
+    returns immediately without making any HTTP requests.
 
 Adapter pattern:
-    yfinance is never called inline inside run(). All fetches go through
-    a module-level DirectAPIAdapter wrapping _raw_fetch_quotes(). To
-    substitute a mock in tests, patch stocks_monitor._adapter.
+    The Yahoo Finance chart API is never called inline inside run(). All
+    fetches go through a module-level DirectAPIAdapter wrapping
+    _raw_fetch_quotes(). To substitute a mock in tests, patch
+    stocks_monitor._adapter.
 
 Alert state machine (per user per ticker):
     - price crosses threshold (up or down) and direction differs from
@@ -34,7 +35,7 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import yfinance as yf
+import requests
 
 from personalassistant.core import discord_notifier, history_store, state_store, user_registry
 from personalassistant.core.data_source_adapter import DirectAPIAdapter
@@ -70,9 +71,24 @@ def is_market_open() -> bool:
 
 # ── yfinance fetch callable (wrapped by adapter) ───────────────────────────────
 
+# Yahoo Finance chart API — direct HTTP (no yfinance dependency for this call)
+_YF_CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+_YF_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+_YF_PARAMS = {"range": "1d", "interval": "1m"}
+_REQUEST_TIMEOUT = 15  # seconds per ticker
+
+
 def _raw_fetch_quotes(params: dict) -> dict:
     """
-    Fetch latest price data for a list of tickers via yfinance fast_info.
+    Fetch latest price data for a list of tickers via the Yahoo Finance
+    chart API (v8).  Uses direct HTTP instead of yfinance fast_info to
+    avoid internal yfinance bugs (e.g. KeyError: 'exchangeTimezoneName').
 
     params:
         {"tickers": list[str]}  — normalised ticker symbols
@@ -80,8 +96,8 @@ def _raw_fetch_quotes(params: dict) -> dict:
     Returns:
         {
           ticker: {
-            "price":      float,
-            "prev_close": float,
+            "price":      float,   # regularMarketPrice from meta
+            "prev_close": float,   # chartPreviousClose from meta
             "pct_change": float,   # positive = up vs. prev close
           },
           ...
@@ -92,10 +108,30 @@ def _raw_fetch_quotes(params: dict) -> dict:
     """
     results: dict = {}
     for ticker in params["tickers"]:
+        url = _YF_CHART_URL.format(ticker=ticker)
         try:
-            fi         = yf.Ticker(ticker).fast_info
-            price      = fi.last_price
-            prev_close = fi.previous_close
+            resp = requests.get(
+                url,
+                params=_YF_PARAMS,
+                headers=_YF_HEADERS,
+                timeout=_REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            chart_result = (
+                data.get("chart", {}).get("result") or []
+            )
+            if not chart_result:
+                error_msg = data.get("chart", {}).get("error") or "no result"
+                logger.warning(
+                    "No chart result for %s — %s — skipped", ticker, error_msg
+                )
+                continue
+
+            meta       = chart_result[0]["meta"]
+            price      = meta.get("regularMarketPrice")
+            prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
 
             if price is None or prev_close is None or prev_close == 0:
                 logger.warning(
@@ -110,6 +146,17 @@ def _raw_fetch_quotes(params: dict) -> dict:
                 "prev_close": round(prev_close, 4),
                 "pct_change": round(pct_change, 4),
             }
+            logger.debug(
+                "Quote OK  %s  price=%.2f  prev_close=%.2f  pct=%.2f%%",
+                ticker, price, prev_close, pct_change,
+            )
+
+        except requests.exceptions.ConnectionError:
+            logger.warning("Network error fetching %s — skipped (will retry next cycle)", ticker)
+        except requests.exceptions.Timeout:
+            logger.warning("Timeout fetching %s after %ds — skipped", ticker, _REQUEST_TIMEOUT)
+        except requests.exceptions.HTTPError as exc:
+            logger.warning("HTTP %s fetching %s — skipped", exc.response.status_code, ticker)
         except Exception:
             logger.exception("Unhandled error fetching quote for %s — skipped", ticker)
 

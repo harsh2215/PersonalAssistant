@@ -60,7 +60,7 @@ if _API_KEY:
 
 _SYSTEM_INSTRUCTION = """
 You are PersonalAssistant, a personal data assistant with access to a specific
-user's stored stock-price history and calendar events via tools.
+user's stored stock-price history, calendar events, and watchlist via tools.
 
 GROUNDING RULES — follow without exception:
 1. Never answer questions about the user's actual stock prices, portfolio
@@ -71,6 +71,15 @@ GROUNDING RULES — follow without exception:
 3. Do not acknowledge any prices, percentages, or event details that you have
    not retrieved via a tool call in this conversation.
 
+TOOL USAGE PATTERNS:
+- To know which stocks the user tracks: call get_watchlist().
+- To summarise all stocks or give a portfolio overview: first call
+  get_watchlist() to discover all tickers, then call get_stock_history()
+  for each ticker individually, then compile the summary.
+- For a single stock question: call get_stock_history() directly with the
+  ticker if the user specifies it, or call get_watchlist() first if the
+  user says "my stocks" without naming one.
+
 You MAY answer general-knowledge questions (e.g. "what is RSI?", "what does
 P/E ratio mean?") from your training — but the moment a question touches the
 user's actual data, call a tool first.
@@ -79,6 +88,8 @@ Response style:
 - Be concise and conversational.
 - Format Indian rupee amounts with the ₹ symbol and comma thousands separators.
 - Show percentage changes with a + or − sign and two decimal places.
+- For stock summaries, use a table or bullet list grouping ticker, price, and
+  change for easy scanning.
 - If the user asks about a ticker not in their watchlist, say so and suggest
   they update their watchlist via the admin CLI.
 """.strip()
@@ -148,6 +159,18 @@ def ask(user_id: str, question: str) -> str:
             )
         return json.dumps(rows, default=str)
 
+    def get_watchlist() -> str:
+        """Return the user's stock watchlist — the list of ticker symbols they are tracking.
+
+        Call this first whenever the user asks about 'my stocks', 'my watchlist',
+        a portfolio summary, or any question that requires knowing all tickers before
+        fetching individual prices.
+        """
+        watchlist = user.get("stock_watchlist", [])
+        if not watchlist:
+            return "The user has no stocks in their watchlist yet."
+        return json.dumps({"watchlist": watchlist, "count": len(watchlist)})
+
     def get_upcoming_events(days: int = 7) -> str:
         """Retrieve the user's upcoming calendar events from stored data synced from Google Calendar.
 
@@ -168,7 +191,7 @@ def ask(user_id: str, question: str) -> str:
 
     config = types.GenerateContentConfig(
         system_instruction=_SYSTEM_INSTRUCTION,
-        tools=[get_stock_history, get_upcoming_events],
+        tools=[get_watchlist, get_stock_history, get_upcoming_events],
         temperature=0.0,
     )
 

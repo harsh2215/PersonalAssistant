@@ -23,6 +23,7 @@ No LLM calls. No Discord interaction. Pure SQLite + stdlib.
 """
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 
@@ -273,4 +274,119 @@ def _cli_register() -> None:
 
 
 if __name__ == "__main__":
-    _cli_register()
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
+
+    init_db()
+
+    def _main_menu() -> None:
+        while True:
+            print("\n══════════════════════════════════════════")
+            print("  PersonalAssistant — User Registry")
+            print("══════════════════════════════════════════")
+            print("  1. Register new user")
+            print("  2. View registered users")
+            print("  3. Edit watchlist")
+            print("  4. Exit")
+            choice = input("\nChoice: ").strip()
+
+            if choice == "1":
+                _cli_register()
+            elif choice == "2":
+                _cli_view_users()
+            elif choice == "3":
+                _cli_edit_watchlist()
+            elif choice == "4":
+                print("Goodbye.")
+                sys.exit(0)
+            else:
+                print("  ⚠ Invalid choice — enter 1, 2, 3, or 4.")
+
+    def _cli_view_users() -> None:
+        users = get_all_users()
+        if not users:
+            print("\n  (no registered users)")
+            return
+        print(f"\n{'─'*60}")
+        for u in users:
+            wl = ", ".join(u["stock_watchlist"]) or "(none)"
+            print(f"  ID        : {u['user_id']}")
+            print(f"  Name      : {u['display_name']}")
+            print(f"  Watchlist : {wl}")
+            print(f"  Threshold : ±{u['alert_threshold_pct']}%")
+            print(f"  Lookahead : {u['calendar_lookahead_days']} days")
+            print(f"  Calendar  : {u.get('google_token_path') or '(not linked)'}")
+            print(f"{'─'*60}")
+
+    def _cli_edit_watchlist() -> None:
+        print("\n══════════════════════════════════════════")
+        print("  Edit Stock Watchlist")
+        print("══════════════════════════════════════════\n")
+
+        user_id = _prompt("Discord user ID").strip()
+        if not user_id:
+            print("✗  Discord ID is required. Aborting.")
+            return
+
+        user = get_user(user_id)
+        if user is None:
+            print(f"✗  User '{user_id}' not found. Register first (option 1).")
+            return
+
+        current = user["stock_watchlist"]
+        current_str = ", ".join(current) if current else "(none)"
+        print(f"\n  User     : {user['display_name']}")
+        print(f"  Watchlist: {current_str}\n")
+
+        print("  a. Add tickers")
+        print("  b. Remove tickers")
+        print("  c. Replace entire watchlist")
+        print("  d. Cancel")
+        sub = input("\n  Choice: ").strip().lower()
+
+        if sub == "a":
+            raw = _prompt("Tickers to add (comma-separated)").strip()
+            if not raw:
+                print("  (nothing entered — no changes made)")
+                return
+            new_tickers = [t.strip() for t in raw.split(",") if t.strip()]
+            merged = list(current) + new_tickers
+            update_user(user_id, stock_watchlist=merged)
+            updated = get_user(user_id)["stock_watchlist"]
+            print(f"\n✓  Watchlist updated: {', '.join(updated) or '(empty)'}")
+
+        elif sub == "b":
+            raw = _prompt("Tickers to remove (comma-separated)").strip()
+            if not raw:
+                print("  (nothing entered — no changes made)")
+                return
+            to_remove = {_normalise_ticker(t) for t in raw.split(",") if t.strip()}
+            remaining = [t for t in current if t not in to_remove]
+            update_user(user_id, stock_watchlist=remaining)
+            updated = get_user(user_id)["stock_watchlist"]
+            removed = to_remove & set(current)
+            not_found = to_remove - set(current)
+            if removed:
+                print(f"\n✓  Removed: {', '.join(sorted(removed))}")
+            if not_found:
+                print(f"  ⚠ Not in watchlist (skipped): {', '.join(sorted(not_found))}")
+            print(f"  Watchlist now: {', '.join(updated) or '(empty)'}")
+
+        elif sub == "c":
+            raw = _prompt("New watchlist (comma-separated, blank to clear)").strip()
+            new_tickers = [t.strip() for t in raw.split(",") if t.strip()]
+            update_user(user_id, stock_watchlist=new_tickers)
+            updated = get_user(user_id)["stock_watchlist"]
+            print(f"\n✓  Watchlist replaced: {', '.join(updated) or '(empty)'}")
+
+        elif sub == "d":
+            print("  Cancelled — no changes made.")
+        else:
+            print("  ⚠ Invalid choice — no changes made.")
+
+    _main_menu()
