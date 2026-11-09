@@ -17,6 +17,8 @@ user_id threading:
     rows — the dispatch function passes user_id directly to history_store.
 
 Tools exposed to the model:
+    get_watchlist()                    — the user's tracked tickers
+    get_latest_quote(ticker)           — live quote (last close when market is closed)
     get_stock_history(ticker, days=7)  — queries history_store, capped at 30 days
     get_upcoming_events(days=7)        — queries history_store, capped at the
                                          user's calendar_lookahead_days setting
@@ -28,33 +30,38 @@ Function-calling loop:
     hit as a safety limit).
 
 SDK: google-genai.
-Model: gemini-2.5-flash.
+Model: see _MODEL_NAME below.
 API key: GEMINI_API_KEY environment variable.
 """
 
 import json
 import logging
-import os
 
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
-
+from personalassistant.agents import stocks_monitor
 from personalassistant.core import history_store, user_registry
-
-load_dotenv()
+from personalassistant.core.config import GEMINI_API_KEY
 
 logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 _MODEL_NAME = "gemini-3.1-flash-lite"
 
-# Initialize Client
-client = None
-if _API_KEY:
-    client = genai.Client(api_key=_API_KEY)
+# Lazily-created, shared Gemini client
+_client: genai.Client | None = None
+
+
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        if not GEMINI_API_KEY:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not set. Copy .env.example to .env and add your key."
+            )
+        _client = genai.Client(api_key=GEMINI_API_KEY)
+    return _client
 
 # ── System instruction ────────────────────────────────────────────────────────
 
@@ -76,6 +83,9 @@ TOOL USAGE PATTERNS:
 - To summarise all stocks or give a portfolio overview: first call
   get_watchlist() to discover all tickers, then call get_stock_history()
   for each ticker individually, then compile the summary.
+- For the CURRENT / latest price (especially if history is empty or the
+  market is closed): call get_latest_quote(ticker). It reports whether the
+  market is open; if closed, the price is the last close — say so.
 - For a single stock question: call get_stock_history() directly with the
   ticker if the user specifies it, or call get_watchlist() first if the
   user says "my stocks" without naming one.
@@ -116,15 +126,7 @@ def ask(user_id: str, question: str) -> str:
         Exception:    Gemini API / network errors are not caught here; the
                       caller (discord_listener) handles them.
     """
-    global client
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not set. Copy .env.example to .env and add your key."
-        )
-
-    if client is None:
-        client = genai.Client(api_key=api_key)
+    client = _get_client()
 
     user = user_registry.get_user(user_id)
     if user is None:
@@ -159,6 +161,28 @@ def ask(user_id: str, question: str) -> str:
             )
         return json.dumps(rows, default=str)
 
+    def get_latest_quote(ticker: str) -> str:
+        """Fetch the latest available live quote for a ticker on the user's watchlist.
+
+        Works even when the market is closed (then the price is the last close).
+        Use this for "current price" questions or when stored history is empty.
+
+        Args:
+            ticker: Ticker symbol, e.g. 'RELIANCE' or 'RELIANCE.NS'.
+        """
+        norm = user_registry.normalise_ticker(ticker)
+        if norm not in user.get("stock_watchlist", []):
+            return f"'{norm}' is not in the user's watchlist."
+        quotes = stocks_monitor.fetch_quotes([norm])
+        quote = quotes.get(norm)
+        if quote is None:
+            return f"Could not fetch a live quote for '{norm}' right now."
+        return json.dumps({
+            "ticker": norm,
+            **quote,
+            "market_open": stocks_monitor.is_market_open(),
+        })
+
     def get_watchlist() -> str:
         """Return the user's stock watchlist — the list of ticker symbols they are tracking.
 
@@ -191,7 +215,7 @@ def ask(user_id: str, question: str) -> str:
 
     config = types.GenerateContentConfig(
         system_instruction=_SYSTEM_INSTRUCTION,
-        tools=[get_watchlist, get_stock_history, get_upcoming_events],
+        tools=[get_watchlist, get_latest_quote, get_stock_history, get_upcoming_events],
         temperature=0.0,
     )
 
@@ -225,19 +249,13 @@ def ask(user_id: str, question: str) -> str:
 
 if __name__ == "__main__":
     import sys
-    from personalassistant.core import history_store as hs, state_store as ss
 
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        stream=sys.stdout,
-    )
+    from personalassistant.core import bootstrap
 
-    hs.init_db()
-    ss.init_db()
-    user_registry.init_db()
+    bootstrap.setup_logging(logging.DEBUG)
+    bootstrap.init_storage()
 
-    if not _API_KEY:
+    if not GEMINI_API_KEY:
         print("Error: GEMINI_API_KEY is not set. Add it to your .env file.")
         sys.exit(1)
 

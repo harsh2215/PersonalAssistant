@@ -29,22 +29,17 @@ Error handling:
 
 import asyncio
 import logging
-import os
+from contextlib import asynccontextmanager
 
+import aiohttp
 import discord
-from dotenv import load_dotenv
 
 from personalassistant.agents import chat_agent
 from personalassistant.core import user_registry
-
-load_dotenv()
+from personalassistant.core.config import DISCORD_BOT_TOKEN
+from personalassistant.core.discord_notifier import split_message
 
 logger = logging.getLogger(__name__)
-
-_TOKEN: str = os.environ.get("DISCORD_BOT_TOKEN", "")
-
-# Discord hard cap on a single message
-_MESSAGE_LIMIT = 2000
 
 # ── Intent setup ──────────────────────────────────────────────────────────────
 # message_content=True is required to read DM text.
@@ -58,17 +53,41 @@ client = discord.Client(intents=intents)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _split(text: str, limit: int = _MESSAGE_LIMIT) -> list[str]:
-    """Chunk text to fit Discord's per-message character limit."""
-    if len(text) <= limit:
-        return [text]
-    return [text[i : i + limit] for i in range(0, len(text), limit)]
-
-
 async def _reply(channel: discord.DMChannel, text: str) -> None:
-    """Send a (possibly chunked) reply to a DM channel."""
-    for chunk in _split(text):
-        await channel.send(chunk)
+    """
+    Send a (possibly chunked) reply to a DM channel.
+
+    Delivery failures (Discord unreachable, DMs closed, DNS outage, …) are
+    logged as a single warning instead of escaping as an unhandled
+    exception from the event handler.
+    """
+    try:
+        for chunk in split_message(text):
+            await channel.send(chunk)
+    except (discord.DiscordException, aiohttp.ClientError, OSError) as exc:
+        logger.warning("Could not deliver reply to channel %s: %s", channel.id, exc)
+
+
+@asynccontextmanager
+async def _typing(channel: discord.DMChannel):
+    """
+    Best-effort "typing…" indicator. It is purely cosmetic, so if Discord
+    can't be reached we log and carry on rather than abort the request.
+    """
+    cm = channel.typing()
+    try:
+        await cm.__aenter__()
+    except (discord.DiscordException, aiohttp.ClientError, OSError) as exc:
+        logger.warning("Typing indicator unavailable: %s", exc)
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            await cm.__aexit__(None, None, None)
+        except Exception:
+            pass
 
 
 # ── Event handlers ────────────────────────────────────────────────────────────
@@ -123,7 +142,7 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # ── 5. Route to chat_agent ────────────────────────────────────────────────
-    async with message.channel.typing():
+    async with _typing(message.channel):
         try:
             # chat_agent.ask() makes blocking HTTP calls to the Gemini API;
             # run it in a thread pool to keep the event loop responsive.
@@ -145,24 +164,17 @@ async def on_message(message: discord.Message) -> None:
 
 if __name__ == "__main__":
     import sys
-    from personalassistant.core import history_store, state_store
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        stream=sys.stdout,
-    )
+    from personalassistant.core import bootstrap
 
-    # Ensure all tables exist before the bot starts receiving messages.
-    user_registry.init_db()
-    history_store.init_db()
-    state_store.init_db()
+    bootstrap.setup_logging()
+    bootstrap.init_storage()
 
-    if not _TOKEN:
+    if not DISCORD_BOT_TOKEN:
         logger.error(
             "DISCORD_BOT_TOKEN is not set. Copy .env.example to .env and fill it in."
         )
         sys.exit(1)
 
     logger.info("Starting PersonalAssistant Discord listener …")
-    client.run(_TOKEN)
+    client.run(DISCORD_BOT_TOKEN, log_handler=None)

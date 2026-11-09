@@ -7,6 +7,8 @@ Modules:
   state_store          — per-user alert-crossing state (alert_state table)
   history_store        — per-user time-series data (stock_history,
                          calendar_events tables)
-  discord_notifier     — outbound alert DMs
+  config               — .env loading + shared constants (single load_dotenv)
+  bootstrap            — logging setup + idempotent table creation
+  discord_notifier     — outbound alert DMs (REST API) + message splitting
   discord_listener     — inbound DM routing to chat_agent
 """

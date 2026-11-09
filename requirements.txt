@@ -1,10 +1,7 @@
-yfinance
+requests
 discord.py
-apscheduler
+apscheduler>=3.10.0
 python-dotenv
-pyyaml
 google-genai
 google-api-python-client
-google-auth-httplib2
 google-auth-oauthlib
-apscheduler>=3.10.0

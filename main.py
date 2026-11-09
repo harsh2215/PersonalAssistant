@@ -14,6 +14,7 @@ Scheduler triggers:
     The monitor itself gates on is_market_open(), so stray scheduler
     ticks (e.g. at exactly 15:30) simply return early.
   - calendar_monitor.run : interval, every 3 hours.
+  - history cleanup      : cron, daily 03:00 IST.
 
 Both jobs use the Asia/Kolkata timezone so APScheduler's "next run time"
 display is meaningful at a glance.
@@ -22,40 +23,23 @@ display is meaningful at a glance.
 import logging
 import sys
 
-from dotenv import load_dotenv
-
-load_dotenv()   # must happen before any module reads os.environ
-
-import os
-
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from personalassistant.agents import calendar_monitor, stocks_monitor
-from personalassistant.core import discord_listener, history_store, state_store, user_registry
+from personalassistant.core import bootstrap, discord_listener, history_store
+from personalassistant.core.config import DISCORD_BOT_TOKEN, STOCK_HISTORY_RETAIN_DAYS
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    stream=sys.stdout,
-)
 logger = logging.getLogger(__name__)
 
-_DISCORD_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 _TZ = "Asia/Kolkata"
 
 
-# ── Storage init ──────────────────────────────────────────────────────────────
-
-def _init_storage() -> None:
-    """Create all SQLite tables if they don't already exist."""
-    user_registry.init_db()
-    history_store.init_db()
-    state_store.init_db()
-    logger.info("Storage initialised.")
+def _cleanup_history() -> None:
+    deleted = history_store.cleanup_old_stock_history(STOCK_HISTORY_RETAIN_DAYS)
+    if deleted:
+        logger.info("Removed %d stale stock history row(s).", deleted)
 
 
 # ── Startup runs ──────────────────────────────────────────────────────────────
@@ -69,7 +53,7 @@ def _run_monitors_now() -> None:
     logger.info("Running startup monitor pass …")
 
     try:
-        stocks_monitor.run()
+        stocks_monitor.run(snapshot_only=True)   # store latest price even if market is closed
         logger.info("stocks_monitor startup run complete.")
     except Exception:
         logger.exception("stocks_monitor startup run failed — continuing anyway.")
@@ -89,6 +73,7 @@ def _build_scheduler() -> BackgroundScheduler:
 
     stocks_monitor  — cron: Mon-Fri, minutes 0 and 30, hours 9 through 15 IST.
     calendar_monitor — interval: every 3 hours.
+    history_cleanup — cron: daily 03:00 IST.
     """
     scheduler = BackgroundScheduler(timezone=_TZ)
 
@@ -115,6 +100,15 @@ def _build_scheduler() -> BackgroundScheduler:
         coalesce=True,
     )
 
+    scheduler.add_job(
+        func=_cleanup_history,
+        trigger=CronTrigger(hour=3, minute=0, timezone=_TZ),
+        id="history_cleanup",
+        name="Stock history cleanup",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+
     scheduler.start()
     return scheduler
 
@@ -132,7 +126,9 @@ def _print_jobs(scheduler: BackgroundScheduler) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    if not _DISCORD_TOKEN:
+    bootstrap.setup_logging()
+
+    if not DISCORD_BOT_TOKEN:
         logger.error(
             "DISCORD_BOT_TOKEN is not set. Copy .env.example to .env and fill it in."
         )
@@ -140,7 +136,8 @@ def main() -> None:
 
     logger.info("PersonalAssistant starting up …")
 
-    _init_storage()
+    bootstrap.init_storage()
+    logger.info("Storage initialised.")
     _run_monitors_now()
 
     scheduler = _build_scheduler()
@@ -148,7 +145,7 @@ def main() -> None:
 
     logger.info("Discord listener starting — press Ctrl+C to stop.")
     try:
-        discord_listener.client.run(_DISCORD_TOKEN)
+        discord_listener.client.run(DISCORD_BOT_TOKEN, log_handler=None)
     except KeyboardInterrupt:
         pass
     finally:

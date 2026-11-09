@@ -7,7 +7,7 @@ Defines:
       Abstract base class with a single required method:
           fetch(params: dict) -> dict
       All monitors must call data through an adapter, never inline to
-      yfinance, the Google Calendar client, or any other external library.
+      the Yahoo quote API, the Google Calendar client, or any other external library.
       This is the seam that allows a backend to be swapped (e.g. to an MCP
       server or a different market data provider) without touching monitor
       logic.
@@ -16,7 +16,7 @@ Defines:
       Concrete implementation that wraps a plain Python callable.
       The callable is injected at construction time; DirectAPIAdapter.fetch()
       calls it with the supplied params dict and returns whatever it returns.
-      Used in Phase 1 to wrap the yfinance fetch function and the Google
+      Used in Phase 1 to wrap the stock-quote fetch function and the Google
       Calendar API call.
 
 No business logic lives here — this file is purely interface + one minimal
@@ -67,7 +67,7 @@ class DirectAPIAdapter(DataSourceAdapter):
 
     The callable receives the params dict exactly as passed to fetch() and
     must return a dict. This is the Phase 1 implementation: monitors call
-    yfinance / the Google Calendar client through a DirectAPIAdapter so
+    the Yahoo quote API / the Google Calendar client through a DirectAPIAdapter so
     the external library is never referenced inline in monitor code.
 
     Example::
