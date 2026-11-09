@@ -295,16 +295,10 @@ def run() -> None:
 if __name__ == "__main__":
     import sys
 
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        stream=sys.stdout,
-    )
+    from personalassistant.core import bootstrap, history_store as hs, user_registry as ur
 
-    from personalassistant.core import history_store as hs, user_registry as ur
-
-    hs.init_db()
-    ur.init_db()
+    bootstrap.setup_logging(logging.DEBUG)
+    bootstrap.init_storage()
 
     print("\n=== Calendar Monitor — Manual Test / Onboarding ===\n")
     user_id = input("Discord user ID to test (must be registered): ").strip()

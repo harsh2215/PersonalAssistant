@@ -160,8 +160,7 @@ def cleanup_old_stock_history(retain_days: int = 30) -> int:
     """
     Delete stock_history rows older than `retain_days` days across ALL users.
 
-    Intended to be called after each monitor cycle from main.py or directly
-    from stocks_monitor after a successful write.
+    Scheduled as a daily job in main.py.
 
     Args:
         retain_days: Rows older than this many days are removed (default 30).

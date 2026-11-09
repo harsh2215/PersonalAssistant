@@ -23,7 +23,6 @@ No LLM calls. No Discord interaction. Pure SQLite + stdlib.
 """
 
 import json
-import logging
 import sqlite3
 from datetime import datetime, timezone
 
@@ -41,7 +40,7 @@ _UPDATABLE_FIELDS = frozenset({
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _normalise_ticker(ticker: str) -> str:
+def normalise_ticker(ticker: str) -> str:
     """Auto-append '.NS' to any ticker that contains neither '.' nor '^'."""
     ticker = ticker.strip().upper()
     if ticker and "." not in ticker and "^" not in ticker:
@@ -54,7 +53,7 @@ def _normalise_watchlist(tickers: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for raw in tickers:
-        t = _normalise_ticker(raw)
+        t = normalise_ticker(raw)
         if t and t not in seen:
             seen.add(t)
             result.append(t)
@@ -269,19 +268,16 @@ def _cli_register() -> None:
     print(f"   Watchlist  : {user['stock_watchlist'] or '(none)'}")
     print(f"   Threshold  : ±{user['alert_threshold_pct']}%")
     print(f"   Lookahead  : {user['calendar_lookahead_days']} days")
-    print(f"   Calendar   : not linked (run onboard_calendar to link)")
+    print("   Calendar   : not linked (run onboard_calendar to link)")
     print()
 
 
 if __name__ == "__main__":
     import sys
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        stream=sys.stdout,
-    )
+    from personalassistant.core import bootstrap
 
+    bootstrap.setup_logging()
     init_db()
 
     def _main_menu() -> None:
@@ -365,7 +361,7 @@ if __name__ == "__main__":
             if not raw:
                 print("  (nothing entered — no changes made)")
                 return
-            to_remove = {_normalise_ticker(t) for t in raw.split(",") if t.strip()}
+            to_remove = {normalise_ticker(t) for t in raw.split(",") if t.strip()}
             remaining = [t for t in current if t not in to_remove]
             update_user(user_id, stock_watchlist=remaining)
             updated = get_user(user_id)["stock_watchlist"]

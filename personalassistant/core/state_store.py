@@ -25,7 +25,6 @@ No business logic about when to alert — that belongs in stocks_monitor.
 No LLM calls. No Discord interaction. Pure state persistence.
 """
 
-import sqlite3
 from datetime import datetime, timezone
 
 from personalassistant.core.db import get_conn

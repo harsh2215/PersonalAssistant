@@ -22,9 +22,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-load_dotenv()
+from personalassistant.core import config  # noqa: F401  (loads .env)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DB = _REPO_ROOT / "data" / "personalassistant.db"
