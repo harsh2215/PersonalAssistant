@@ -29,7 +29,16 @@ _TIMEOUT = 15  # seconds
 
 
 def split_message(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
-    """Split text into chunks that fit within Discord's per-message limit."""
+    """Split text into chunks that fit within Discord's per-message character limit.
+
+    Args:
+        text:  The full message text to split.
+        limit: Maximum characters per chunk. Defaults to DISCORD_MESSAGE_LIMIT (2000).
+
+    Returns:
+        A list of strings each at most ``limit`` characters long.  If the
+        input already fits, a single-element list is returned.
+    """
     if len(text) <= limit:
         return [text]
     return [text[i : i + limit] for i in range(0, len(text), limit)]
@@ -39,8 +48,17 @@ def send_alert(user_id: str, title: str, body: str) -> None:
     """
     Send a Discord DM alert formatted as ``**<title>**\\n<body>``.
 
+    Opens a DM channel with ``user_id`` via the Discord REST API, then
+    posts the message (split into chunks if it exceeds the 2 000-character
+    limit).
+
     Guaranteed not to raise — all failures are logged and swallowed so
-    the calling monitor job can continue.
+    the calling monitor job can continue processing other users.
+
+    Args:
+        user_id: Discord snowflake (string) of the recipient.
+        title:   Short alert title rendered in bold at the top of the message.
+        body:    Multi-line alert detail rendered below the title.
     """
     if not DISCORD_BOT_TOKEN:
         logger.error("DISCORD_BOT_TOKEN is not set — cannot send DM to user %s", user_id)

@@ -15,6 +15,8 @@ Calendar events:
         Atomically deletes all existing rows for this user, then reinserts the
         supplied list. Keeps the table idempotent across polls.
     get_upcoming_events(user_id, days=7) -> list[dict], by start_time ASC
+    get_events_starting_soon(user_id, within_minutes) -> list[dict]
+        Only timed events (not all-day) starting within the next N minutes.
 
 Table schemas
 ─────────────
@@ -231,6 +233,18 @@ def replace_calendar_events(user_id: str, events: list[dict]) -> None:
             )
 
 
+def _parse_event_dt(time_str: str) -> datetime | None:
+    """Parse an ISO-8601 string into an aware datetime (UTC fallback)."""
+    try:
+        s = time_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
 def get_upcoming_events(user_id: str, days: int = 7) -> list[dict]:
     """
     Return calendar events whose start_time falls within the next `days` days,
@@ -238,7 +252,7 @@ def get_upcoming_events(user_id: str, days: int = 7) -> list[dict]:
 
     The lower bound is "now" so past events are excluded even if they are
     stored (e.g. a poll ran earlier today and events from this morning are
-    still in the table).
+    still in the table). All-day events for today are preserved.
 
     Args:
         user_id: Discord snowflake.
@@ -249,9 +263,6 @@ def get_upcoming_events(user_id: str, days: int = 7) -> list[dict]:
         List of dicts with keys: id, user_id, event_id, title, start_time,
         end_time, location, fetched_at.  Empty list if none found.
     """
-    now_str    = datetime.now(timezone.utc).isoformat()
-    horizon    = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -259,10 +270,85 @@ def get_upcoming_events(user_id: str, days: int = 7) -> list[dict]:
                    location, fetched_at
             FROM   calendar_events
             WHERE  user_id = ?
-              AND  start_time >= ?
-              AND  start_time <= ?
-            ORDER  BY start_time ASC
             """,
-            (user_id, now_str, horizon),
+            (user_id,),
         ).fetchall()
-    return [dict(r) for r in rows]
+
+    now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=days)
+
+    results: list[tuple[datetime, dict]] = []
+    for r in rows:
+        d = dict(r)
+
+        # All-day event (YYYY-MM-DD, no time component):
+        if "T" not in d["start_time"]:
+            try:
+                start_date = datetime.strptime(d["start_time"], "%Y-%m-%d").date()
+                end_date = (
+                    datetime.strptime(d["end_time"], "%Y-%m-%d").date()
+                    if d.get("end_time") and "T" not in d["end_time"]
+                    else start_date
+                )
+                if end_date >= now.date() and start_date <= horizon.date():
+                    event_dt = datetime.combine(
+                        start_date, datetime.min.time(), tzinfo=timezone.utc
+                    )
+                    results.append((event_dt, d))
+            except ValueError:
+                pass
+            continue
+
+        st = _parse_event_dt(d["start_time"])
+        et = _parse_event_dt(d.get("end_time", "")) if d.get("end_time") else st
+
+        # Timed event: keep if end_time >= now (or start_time >= now) and start_time <= horizon
+        end_bound = et if et is not None else st
+        if end_bound is not None and st is not None and end_bound >= now and st <= horizon:
+            results.append((st, d))
+
+    results.sort(key=lambda x: x[0])
+    return [d for _, d in results]
+
+
+def get_events_starting_soon(user_id: str, within_minutes: int) -> list[dict]:
+    """
+    Return calendar events that start within the next ``within_minutes`` minutes.
+
+    Only timed events are returned — all-day events (whose ``start_time``
+    contains only a date string, e.g. ``"2026-11-10"``) are excluded because
+    minute-level alerting doesn't apply to them.
+
+    Args:
+        user_id:        Discord snowflake.
+        within_minutes: Look-ahead window in whole minutes.
+
+    Returns:
+        List of event dicts with keys: id, user_id, event_id, title,
+        start_time, end_time, location, fetched_at — ordered by
+        start_time ASC.  Empty list if none found.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, user_id, event_id, title, start_time, end_time,
+                   location, fetched_at
+            FROM   calendar_events
+            WHERE  user_id = ?
+              AND  start_time LIKE '%T%'
+            """,
+            (user_id,),
+        ).fetchall()
+
+    now = datetime.now(timezone.utc)
+    horizon = now + timedelta(minutes=within_minutes)
+
+    matched: list[tuple[datetime, dict]] = []
+    for r in rows:
+        d = dict(r)
+        dt = _parse_event_dt(d["start_time"])
+        if dt is not None and now <= dt <= horizon:
+            matched.append((dt, d))
+
+    matched.sort(key=lambda x: x[0])
+    return [d for _, d in matched]

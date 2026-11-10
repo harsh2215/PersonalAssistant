@@ -14,6 +14,8 @@ Scheduler triggers:
     The monitor itself gates on is_market_open(), so stray scheduler
     ticks (e.g. at exactly 15:30) simply return early.
   - calendar_monitor.run : interval, every 3 hours.
+  - calendar_monitor.check_alerts : interval, every 15 minutes.
+    Sends near-event DMs from already-stored data; no Google API calls.
   - history cleanup      : cron, daily 03:00 IST.
 
 Both jobs use the Asia/Kolkata timezone so APScheduler's "next run time"
@@ -37,6 +39,7 @@ _TZ = "Asia/Kolkata"
 
 
 def _cleanup_history() -> None:
+    """Delete stock_history rows older than STOCK_HISTORY_RETAIN_DAYS. Called daily at 03:00 IST."""
     deleted = history_store.cleanup_old_stock_history(STOCK_HISTORY_RETAIN_DAYS)
     if deleted:
         logger.info("Removed %d stale stock history row(s).", deleted)
@@ -61,6 +64,8 @@ def _run_monitors_now() -> None:
     try:
         calendar_monitor.run()
         logger.info("calendar_monitor startup run complete.")
+        calendar_monitor.check_alerts()
+        logger.info("calendar_monitor startup alert check complete.")
     except Exception:
         logger.exception("calendar_monitor startup run failed — continuing anyway.")
 
@@ -71,9 +76,10 @@ def _build_scheduler() -> BackgroundScheduler:
     """
     Configure and return a started BackgroundScheduler with both monitor jobs.
 
-    stocks_monitor  — cron: Mon-Fri, minutes 0 and 30, hours 9 through 15 IST.
+    stocks_monitor   — cron: Mon-Fri, minutes 0 and 30, hours 9 through 15 IST.
     calendar_monitor — interval: every 3 hours.
-    history_cleanup — cron: daily 03:00 IST.
+    calendar_alerts  — interval: every 15 minutes (no Google API; reads stored events).
+    history_cleanup  — cron: daily 03:00 IST.
     """
     scheduler = BackgroundScheduler(timezone=_TZ)
 
@@ -97,6 +103,15 @@ def _build_scheduler() -> BackgroundScheduler:
         id="calendar_monitor",
         name="Google Calendar monitor",
         misfire_grace_time=600,
+        coalesce=True,
+    )
+
+    scheduler.add_job(
+        func=calendar_monitor.check_alerts,
+        trigger=IntervalTrigger(minutes=15, timezone=_TZ),
+        id="calendar_alerts",
+        name="Calendar event alerts",
+        misfire_grace_time=300,
         coalesce=True,
     )
 
@@ -126,6 +141,7 @@ def _print_jobs(scheduler: BackgroundScheduler) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    """Application entry point. See module docstring for the full start-up sequence."""
     bootstrap.setup_logging()
 
     if not DISCORD_BOT_TOKEN:
