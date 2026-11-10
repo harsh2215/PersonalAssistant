@@ -10,6 +10,12 @@ from personalassistant.core import history_store, state_store, user_registry
 
 
 def setup_logging(level: int = logging.INFO) -> None:
+    """Configure root logging to stdout with a timestamp + level prefix.
+
+    Args:
+        level: Logging level (e.g. ``logging.DEBUG``, ``logging.INFO``).
+               Defaults to INFO.
+    """
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

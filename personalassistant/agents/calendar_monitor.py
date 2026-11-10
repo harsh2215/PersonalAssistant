@@ -1,10 +1,13 @@
 """
 calendar_monitor.py — Deterministic Google Calendar monitor. No LLM calls.
 
-Entry point:
-    run() — fetches upcoming events for every user who has completed
-    Google Calendar OAuth onboarding, then atomically replaces their
-    calendar_events rows in history_store.
+Entry points:
+    run()          — fetches upcoming events for every linked user, atomically
+                     replaces their calendar_events rows in history_store, and
+                     cleans up stale alert state. Called every 3 hours.
+    check_alerts() — queries stored events (no Google API calls) and sends a
+                     Discord DM for any event starting within
+                     CALENDAR_ALERT_LOOKAHEAD_MINUTES. Called every 15 minutes.
 
 Credentials:
     Shared OAuth client secrets live at config/google_credentials.json
@@ -26,9 +29,11 @@ Adapter pattern:
     _raw_fetch_calendar(). To substitute a mock in tests, patch
     calendar_monitor._adapter.
 
-Alerting:
-    Not implemented in this module — run() only fetches and stores.
-    Near-term-event alerts are deferred to a future step.
+Alert deduplication:
+    check_alerts() calls state_store.has_calendar_alert_been_sent() before
+    sending and state_store.mark_calendar_alert_sent() after. Each event
+    triggers at most one DM regardless of how many 15-minute ticks pass.
+    All-day events (no time component in start_time) are skipped.
 """
 
 import logging
@@ -41,7 +46,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from personalassistant.core import history_store, user_registry
+from personalassistant.core import discord_notifier, history_store, state_store, user_registry
+from personalassistant.core.config import CALENDAR_ALERT_LOOKAHEAD_MINUTES, IST as _IST
 from personalassistant.core.data_source_adapter import DirectAPIAdapter
 
 logger = logging.getLogger(__name__)
@@ -273,6 +279,15 @@ def run() -> None:
         try:
             events = _fetch_events(user, lookahead)
             history_store.replace_calendar_events(user_id, events)
+            # Keep alert-state table tidy: drop rows for events no longer upcoming.
+            stale = state_store.clear_stale_calendar_alerts(
+                user_id, {e["event_id"] for e in events}
+            )
+            if stale:
+                logger.debug(
+                    "Cleared %d stale calendar alert state row(s) for user %s",
+                    stale, user_id,
+                )
             logger.info(
                 "Calendar synced for user %s (%s): %d event(s) over next %d day(s)",
                 user_id, user["display_name"], len(events), lookahead,
@@ -287,6 +302,142 @@ def run() -> None:
         except Exception:
             logger.exception(
                 "Unexpected error syncing calendar for user %s", user_id
+            )
+
+
+# ── Alert helpers ─────────────────────────────────────────────────────────────
+
+def _parse_event_dt(start_time_str: str) -> datetime | None:
+    """
+    Parse an ISO-8601 dateTime string into an aware datetime.
+
+    Handles both ``+HH:MM`` offset notation and the ``Z`` suffix (UTC).
+    Returns None if the string cannot be parsed (e.g. a bare date string
+    without a time component, which should be pre-filtered by the caller).
+    """
+    try:
+        # Python 3.10 fromisoformat() doesn't understand the trailing 'Z'
+        s = start_time_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def _minutes_until(start_time_str: str) -> int | None:
+    """Return whole minutes from now until start_time_str, or None if unparseable."""
+    dt = _parse_event_dt(start_time_str)
+    if dt is None:
+        return None
+    delta = dt - datetime.now(timezone.utc)
+    return int(delta.total_seconds() // 60)
+
+
+def _build_calendar_alert_body(event: dict, minutes_away: int) -> str:
+    """Format the DM body for a calendar event alert.
+
+    Args:
+        event:        Event dict from history_store (must have start_time, optionally location).
+        minutes_away: Whole minutes until the event starts (may be 0 or negative).
+
+    Returns:
+        A short multi-line string ready for discord_notifier.send_alert().
+    """
+    if minutes_away <= 0:
+        time_str = "starting now"
+    elif minutes_away == 1:
+        time_str = "in 1 minute"
+    else:
+        time_str = f"in {minutes_away} minutes"
+
+    dt = _parse_event_dt(event["start_time"])
+    if dt is not None:
+        start_str = dt.astimezone(_IST).strftime("%I:%M %p IST").lstrip("0")
+    else:
+        start_str = event["start_time"]
+
+    lines = [f"Starts {time_str} — at {start_str}"]
+    if event.get("location"):
+        lines.append(f"📍 {event['location']}")
+    return "\n".join(lines)
+
+
+def _check_user_alerts(user: dict) -> None:
+    """Check and fire pending calendar alerts for a single user.
+
+    Queries stored events starting within CALENDAR_ALERT_LOOKAHEAD_MINUTES,
+    then for each one not yet alerted sends a Discord DM and marks it as sent.
+    """
+    user_id = user["user_id"]
+    upcoming = history_store.get_events_starting_soon(
+        user_id, CALENDAR_ALERT_LOOKAHEAD_MINUTES
+    )
+    if not upcoming:
+        return
+
+    for event in upcoming:
+        event_id = event["event_id"]
+
+        if state_store.has_calendar_alert_been_sent(user_id, event_id):
+            logger.debug(
+                "Calendar alert suppressed (already sent) → user=%s event=%s",
+                user_id, event_id,
+            )
+            continue
+
+        minutes_away = _minutes_until(event["start_time"])
+        if minutes_away is None:
+            # Unparseable start_time — skip silently (should not happen after LIKE filter)
+            logger.warning(
+                "Could not parse start_time %r for event %s — skipping alert",
+                event["start_time"], event_id,
+            )
+            continue
+
+        discord_notifier.send_alert(
+            user_id,
+            title=f"📅 {event['title']}",
+            body=_build_calendar_alert_body(event, minutes_away),
+        )
+        state_store.mark_calendar_alert_sent(user_id, event_id)
+        logger.info(
+            "Calendar alert sent → user=%s event=%s starts_in=%dm",
+            user_id, event_id, minutes_away,
+        )
+
+
+# ── Alert entry point ─────────────────────────────────────────────────────────
+
+def check_alerts() -> None:
+    """
+    Calendar alert cycle — no Google API calls.
+
+    Called by APScheduler every 15 minutes. For every registered user who
+    has linked their Google Calendar, queries stored events starting within
+    CALENDAR_ALERT_LOOKAHEAD_MINUTES and sends a Discord DM for any event
+    not yet alerted. Each event generates at most one DM (tracked via
+    state_store.calendar_alert_state).
+
+    All-day events (bare date strings without a time component) are skipped.
+    Per-user errors are caught and logged without aborting the cycle.
+    """
+    users = user_registry.get_all_users()
+    if not users:
+        return
+
+    for user in users:
+        user_id = user["user_id"]
+
+        if not user.get("google_token_path"):
+            continue   # calendar not linked
+
+        try:
+            _check_user_alerts(user)
+        except Exception:
+            logger.exception(
+                "Calendar alert check failed for user %s — continuing", user_id
             )
 
 

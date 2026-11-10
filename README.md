@@ -3,14 +3,15 @@
 A multi-tenant background service that:
 
 - **Monitors stock prices** (NSE/Yahoo Finance) and DMs you on Discord when a stock moves past your threshold.
-- **Syncs Google Calendar** events per user into local storage.
+- **Syncs Google Calendar** events per user and sends Discord DM alerts for upcoming events.
 - **Answers questions** about your stored data in Discord DMs, using a Gemini-backed chat agent grounded in tool calls (it never invents prices or events).
 
 ## Architecture
 
 ```
 main.py ── APScheduler ──┬─ stocks_monitor     Mon–Fri, :00/:30, 9–15 IST (gated on 09:15–15:30)
-   │                     ├─ calendar_monitor   every 3 hours
+   │                     ├─ calendar_monitor   every 3 hours (sync from Google Calendar)
+   │                     ├─ calendar_alerts    every 15 minutes (near-term event alerts)
    │                     └─ history cleanup    daily 03:00 IST
    └─ Discord listener (DMs) ──► chat_agent (Gemini + tools) ──► history_store / user_registry
 ```
@@ -19,20 +20,22 @@ main.py ── APScheduler ──┬─ stocks_monitor     Mon–Fri, :00/:30, 9
 |---|---|
 | `main.py` | Orchestrator: init storage, run monitors once, schedule jobs, run the bot |
 | `agents/stocks_monitor.py` | No LLM. Concurrent quote fetch (shared session, retries), per-user threshold alerts with de-duplication |
-| `agents/calendar_monitor.py` | No LLM. Per-user Google OAuth, replaces each user's stored events |
+| `agents/calendar_monitor.py` | No LLM. Per-user Google OAuth, replaces each user's stored events, sends Discord DM alerts for events starting soon |
 | `agents/chat_agent.py` | Gemini function-calling over `get_watchlist`, `get_latest_quote` (live; last close when market is closed), `get_stock_history`, `get_upcoming_events` (all scoped to the asking user) |
 | `core/config.py` | Loads `.env` once; shared constants |
 | `core/bootstrap.py` | Logging setup + idempotent table creation |
 | `core/db.py` | SQLite (WAL) connection context manager |
 | `core/user_registry.py` | Users + watchlists; interactive admin CLI |
 | `core/history_store.py` | Stock price history and calendar events |
-| `core/state_store.py` | Last alert direction per (user, ticker) |
+| `core/state_store.py` | Last alert direction per (user, ticker) and calendar alert deduplication |
 | `core/discord_listener.py` / `discord_notifier.py` | Inbound DM handling / outbound alerts via the Discord REST API |
 | `core/data_source_adapter.py` | Adapter seam so data backends can be swapped (e.g. MCP) without touching monitors |
 
 ### Alert behaviour
 
-For each user and ticker, the change vs. previous close is compared with the user's `alert_threshold_pct`. An alert is sent on the first crossing in a direction; further polls in the same direction are suppressed; when the price returns inside the band the state resets so the next crossing alerts again. On startup the monitor takes one price snapshot even if the market is closed (stored, no alerts), so the chat agent always has data. Market holidays are not handled (a holiday poll just sees no movement).
+**Stocks:** For each user and ticker, the change vs. previous close is compared with the user's `alert_threshold_pct`. An alert is sent on the first crossing in a direction; further polls in the same direction are suppressed; when the price returns inside the band the state resets so the next crossing alerts again. On startup the monitor takes one price snapshot even if the market is closed (stored, no alerts), so the chat agent always has data. Market holidays are not handled (a holiday poll just sees no movement).
+
+**Calendar:** Every 15 minutes, the service checks stored events for any timed event starting within `CALENDAR_ALERT_LOOKAHEAD_MINUTES` (default 30 min). Alerts are deduplicated in SQLite (`calendar_alert_state`), ensuring each event triggers at most one Discord DM.
 
 ## Setup
 
@@ -49,6 +52,7 @@ cp .env.example .env     # then fill in the values below
 | `DISCORD_BOT_TOKEN` | Bot token from the Discord Developer Portal |
 | `GEMINI_API_KEY` | Google AI Studio key for the chat agent |
 | `DB_PATH` *(optional)* | SQLite file path; defaults to `data/personalassistant.db` |
+| `CALENDAR_ALERT_LOOKAHEAD_MINUTES` *(optional)* | Minutes before calendar event to send alert; defaults to `30` |
 
 **Discord:** in the Developer Portal → your bot → Bot → *Privileged Gateway Intents*, enable **Message Content Intent**. Users must share a server with the bot (or have DMs open) to receive DMs.
 

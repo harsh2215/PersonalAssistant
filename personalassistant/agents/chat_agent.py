@@ -29,8 +29,8 @@ Function-calling loop:
     repeat until the model returns a final text part (or MAX_TOOL_ROUNDS is
     hit as a safety limit).
 
-SDK: google-genai.
-Model: see _MODEL_NAME below.
+SDK: google-genai (``pip install google-genai``).
+Model: gemini-3.1-flash-lite (see ``_MODEL_NAME``).
 API key: GEMINI_API_KEY environment variable.
 """
 
@@ -54,6 +54,11 @@ _client: genai.Client | None = None
 
 
 def _get_client() -> genai.Client:
+    """Return the shared Gemini client, creating it on first call.
+
+    Raises:
+        RuntimeError: if GEMINI_API_KEY is not set.
+    """
     global _client
     if _client is None:
         if not GEMINI_API_KEY:

@@ -191,6 +191,20 @@ def _build_alert_message(
     pct_change: float,
     threshold: float,
 ) -> str:
+    """Format the body text for a price-threshold alert Discord DM.
+
+    Args:
+        display_name: Human-readable name of the user (shown at the bottom).
+        ticker:       Normalised ticker symbol (e.g. ``RELIANCE.NS``).
+        price:        Current market price.
+        prev_close:   Previous session's closing price.
+        pct_change:   Percentage change relative to prev_close (signed).
+        threshold:    The user's configured alert threshold (unsigned %).
+
+    Returns:
+        A multi-line string formatted for Discord, including price, prev close,
+        percentage change, threshold, and the user's display name.
+    """
     sign = "+" if pct_change >= 0 else ""
     return (
         f"Price: ₹{price:,.2f}  •  Prev close: ₹{prev_close:,.2f}\n"
