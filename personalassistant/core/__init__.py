@@ -3,10 +3,10 @@ core/ — Infrastructure and shared services used by all agents.
 
 Modules:
   data_source_adapter  — DataSourceAdapter ABC + DirectAPIAdapter
-  user_registry        — user CRUD and terminal Google OAuth onboarding
+  user_registry        — user CRUD, ticker normalisation, admin CLI
   state_store          — per-user alert state (alert_state, calendar_alert_state)
   history_store        — per-user time-series data (stock_history,
-                         calendar_events tables)
+                         calendar_events, calendar_sync tables)
   config               — .env loading + shared constants (single load_dotenv)
   bootstrap            — logging setup + idempotent table creation
   discord_notifier     — outbound alert DMs (REST API) + message splitting

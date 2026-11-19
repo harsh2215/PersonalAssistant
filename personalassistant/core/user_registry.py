@@ -1,5 +1,5 @@
 """
-user_registry.py — User CRUD and terminal-driven OAuth onboarding.
+user_registry.py — User CRUD, ticker normalisation and the admin CLI.
 
 Responsibilities:
 - Own the `users` SQLite table schema and provide a clean interface over it:
@@ -11,9 +11,10 @@ Responsibilities:
     remove_user(user_id)               — delete; raises if not found
 - Normalise tickers on every write: auto-append ".NS" to any ticker that
   contains neither "." nor "^".
-- Provide a __main__ CLI entry point for interactive user registration.
-  (Google Calendar onboarding — OAuth consent flow — is a separate step,
-  handled later in onboard_calendar().)
+- Provide a __main__ CLI entry point for interactive user registration and
+  watchlist editing. Google Calendar linking is a separate step handled by
+  `python -m personalassistant.agents.calendar_monitor` (OAuth consent flow),
+  which records the token path on the user via update_user().
 
 DB path is read from the DB_PATH env var, defaulting to
 data/personalassistant.db relative to the repo root. This keeps the module
@@ -268,7 +269,7 @@ def _cli_register() -> None:
     print(f"   Watchlist  : {user['stock_watchlist'] or '(none)'}")
     print(f"   Threshold  : ±{user['alert_threshold_pct']}%")
     print(f"   Lookahead  : {user['calendar_lookahead_days']} days")
-    print("   Calendar   : not linked (run onboard_calendar to link)")
+    print("   Calendar   : not linked (run: python -m personalassistant.agents.calendar_monitor)")
     print()
 
 

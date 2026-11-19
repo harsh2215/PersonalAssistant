@@ -25,6 +25,9 @@ Error handling:
     - Unknown user → brief "not registered" reply, no further processing.
     - chat_agent raises → log exception, send a generic error reply.
     - Empty messages (bot message, non-DM) → silently ignored.
+    - Discord itself unreachable (DNS outage, DMs closed, …) → the typing
+      indicator and reply sends are best-effort: one warning is logged and
+      the handler returns instead of raising. The reply is not retried.
 """
 
 import asyncio

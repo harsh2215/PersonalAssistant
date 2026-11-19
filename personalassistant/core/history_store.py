@@ -15,6 +15,11 @@ Calendar events:
         Atomically deletes all existing rows for this user, then reinserts the
         supplied list. Keeps the table idempotent across polls.
     get_upcoming_events(user_id, days=7) -> list[dict], by start_time ASC
+        `days` counts calendar days in IST *including today* (days=1 → the
+        rest of today, days=2 → today + tomorrow).
+    get_calendar_sync_status(user_id) -> dict | None
+    record_calendar_sync_error(user_id, message)
+        Sync bookkeeping so readers can tell "no events" from "sync broken".
     get_events_starting_soon(user_id, within_minutes) -> list[dict]
         Only timed events (not all-day) starting within the next N minutes.
 
@@ -42,11 +47,18 @@ calendar_events:
     UNIQUE (user_id, event_id)
     INDEX on (user_id, start_time)
 
+calendar_sync:
+    user_id         TEXT PRIMARY KEY
+    last_success_at TEXT           -- UTC ISO-8601 of the last successful sync
+    last_error      TEXT           -- message of the most recent failure, cleared on success
+    last_error_at   TEXT           -- UTC ISO-8601
+
 No LLM calls. No Discord interaction. Pure SQLite reads and writes.
 """
 
 from datetime import datetime, timedelta, timezone
 
+from personalassistant.core.config import IST
 from personalassistant.core.db import get_conn
 
 
@@ -54,8 +66,8 @@ from personalassistant.core.db import get_conn
 
 def init_db() -> None:
     """
-    Create stock_history and calendar_events tables (and their indexes) if
-    they don't already exist. Safe to call multiple times.
+    Create stock_history, calendar_events and calendar_sync tables (and their
+    indexes) if they don't already exist. Safe to call multiple times.
     """
     with get_conn() as conn:
         # ── stock_history ────────────────────────────────────────────────────
@@ -92,6 +104,16 @@ def init_db() -> None:
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_calendar_events_lookup
             ON calendar_events (user_id, start_time)
+        """)
+
+        # ── calendar_sync ────────────────────────────────────────────────────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS calendar_sync (
+                user_id         TEXT PRIMARY KEY,
+                last_success_at TEXT,
+                last_error      TEXT,
+                last_error_at   TEXT
+            )
         """)
 
 
@@ -186,7 +208,8 @@ def replace_calendar_events(user_id: str, events: list[dict]) -> None:
     Atomically replace all calendar events for a user with the supplied list.
 
     The delete and all inserts run inside a single transaction so there is no
-    window during which the user's events appear empty.
+    window during which the user's events appear empty. The same transaction
+    marks the sync as successful (clearing any previous error).
 
     Each dict in `events` must contain:
         event_id   (str)        — Google Calendar event ID
@@ -231,6 +254,47 @@ def replace_calendar_events(user_id: str, events: list[dict]) -> None:
                 """,
                 rows_to_insert,
             )
+        conn.execute(
+            """
+            INSERT INTO calendar_sync (user_id, last_success_at, last_error, last_error_at)
+            VALUES (?, ?, NULL, NULL)
+            ON CONFLICT (user_id) DO UPDATE SET
+                last_success_at = excluded.last_success_at,
+                last_error      = NULL,
+                last_error_at   = NULL
+            """,
+            (user_id, now),
+        )
+
+
+def record_calendar_sync_error(user_id: str, message: str) -> None:
+    """Remember that the latest calendar sync for user_id failed (keeps last_success_at)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO calendar_sync (user_id, last_success_at, last_error, last_error_at)
+            VALUES (?, NULL, ?, ?)
+            ON CONFLICT (user_id) DO UPDATE SET
+                last_error    = excluded.last_error,
+                last_error_at = excluded.last_error_at
+            """,
+            (user_id, message, now),
+        )
+
+
+def get_calendar_sync_status(user_id: str) -> dict | None:
+    """
+    Return {"last_success_at", "last_error", "last_error_at"} for the user,
+    or None if no sync has ever been attempted.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT last_success_at, last_error, last_error_at "
+            "FROM calendar_sync WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def _parse_event_dt(time_str: str) -> datetime | None:
@@ -247,17 +311,20 @@ def _parse_event_dt(time_str: str) -> datetime | None:
 
 def get_upcoming_events(user_id: str, days: int = 7) -> list[dict]:
     """
-    Return calendar events whose start_time falls within the next `days` days,
-    ordered by start_time ascending.
+    Return upcoming calendar events, ordered by start_time ascending.
 
-    The lower bound is "now" so past events are excluded even if they are
-    stored (e.g. a poll ran earlier today and events from this morning are
-    still in the table). All-day events for today are preserved.
+    The window runs from "now" to the end of the IST calendar day that is
+    `days` days long counting today — days=1 means "the rest of today",
+    days=2 "today and tomorrow". Day boundaries are IST so "tomorrow" means
+    what the user means. Events that already ended are excluded; an event in
+    progress is kept. All-day events are kept for every day they span
+    (Google's all-day end date is exclusive, which is handled here).
 
     Args:
         user_id: Discord snowflake.
-        days:    Look-ahead window in days (default 7; caller typically passes
-                 the user's calendar_lookahead_days from the registry).
+        days:    Number of IST calendar days to cover, including today
+                 (default 7; callers typically cap it at the user's
+                 calendar_lookahead_days).
 
     Returns:
         List of dicts with keys: id, user_id, event_id, title, start_time,
@@ -275,7 +342,10 @@ def get_upcoming_events(user_id: str, days: int = 7) -> list[dict]:
         ).fetchall()
 
     now = datetime.now(timezone.utc)
-    horizon = now + timedelta(days=days)
+    today_ist = now.astimezone(IST).date()
+    # Exclusive horizon: midnight IST at the start of day (today + days).
+    horizon = datetime.combine(today_ist + timedelta(days=days), datetime.min.time(), tzinfo=IST)
+    horizon_date = horizon.date()
 
     results: list[tuple[datetime, dict]] = []
     for r in rows:
@@ -285,14 +355,18 @@ def get_upcoming_events(user_id: str, days: int = 7) -> list[dict]:
         if "T" not in d["start_time"]:
             try:
                 start_date = datetime.strptime(d["start_time"], "%Y-%m-%d").date()
-                end_date = (
-                    datetime.strptime(d["end_time"], "%Y-%m-%d").date()
+                # Google's all-day `end` date is EXCLUSIVE (a one-day event on
+                # the 19th has end = the 20th), so the last day it covers is
+                # end - 1; fall back to a single day if end is missing.
+                last_date = (
+                    datetime.strptime(d["end_time"], "%Y-%m-%d").date() - timedelta(days=1)
                     if d.get("end_time") and "T" not in d["end_time"]
                     else start_date
                 )
-                if end_date >= now.date() and start_date <= horizon.date():
+                last_date = max(last_date, start_date)
+                if last_date >= today_ist and start_date < horizon_date:
                     event_dt = datetime.combine(
-                        start_date, datetime.min.time(), tzinfo=timezone.utc
+                        start_date, datetime.min.time(), tzinfo=IST
                     )
                     results.append((event_dt, d))
             except ValueError:
@@ -302,9 +376,9 @@ def get_upcoming_events(user_id: str, days: int = 7) -> list[dict]:
         st = _parse_event_dt(d["start_time"])
         et = _parse_event_dt(d.get("end_time", "")) if d.get("end_time") else st
 
-        # Timed event: keep if end_time >= now (or start_time >= now) and start_time <= horizon
+        # Timed event: keep if it hasn't ended yet and starts before the horizon
         end_bound = et if et is not None else st
-        if end_bound is not None and st is not None and end_bound >= now and st <= horizon:
+        if end_bound is not None and st is not None and end_bound >= now and st < horizon:
             results.append((st, d))
 
     results.sort(key=lambda x: x[0])

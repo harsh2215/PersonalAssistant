@@ -4,7 +4,10 @@ calendar_monitor.py — Deterministic Google Calendar monitor. No LLM calls.
 Entry points:
     run()          — fetches upcoming events for every linked user, atomically
                      replaces their calendar_events rows in history_store, and
-                     cleans up stale alert state. Called every 3 hours.
+                     cleans up stale alert state. Called every 3 hours. Never
+                     opens a browser: if a user's Google token is dead it
+                     records the failure (history_store.calendar_sync), logs
+                     it, and DMs the user once per process to re-link.
     check_alerts() — queries stored events (no Google API calls) and sends a
                      Discord DM for any event starting within
                      CALENDAR_ALERT_LOOKAHEAD_MINUTES. Called every 15 minutes.
@@ -15,13 +18,15 @@ Credentials:
     Per-user token files are cached at data/google_token_<user_id>.json
     (also gitignored).
 
-    _get_credentials(user) implements a three-step credential resolution:
+    _get_credentials(user, interactive=False) resolves credentials in order:
       1. Load the cached token file if it exists.
       2. Silently refresh if expired and a refresh_token is present.
-      3. Launch InstalledAppFlow.run_local_server() for first-time or
-         revoked consent — this opens a browser and is the expected
-         Phase 1 onboarding path. The resulting token is cached and the
-         user registry is updated with its path.
+      3. If still invalid: with interactive=True launch
+         InstalledAppFlow.run_local_server() (opens a browser; used only by
+         the manual CLI below); otherwise raise CalendarAuthError.
+    To (re-)link an account run:  python -m personalassistant.agents.calendar_monitor
+    Note: Google expires refresh tokens after 7 days while the OAuth consent
+    screen is in "Testing" mode — publish the app ("In production") to stop that.
 
 Adapter pattern:
     The Google Calendar API client is never called inline in run(). All
@@ -60,13 +65,17 @@ _TOKEN_DIR        = _REPO_ROOT / "data"
 _SCOPES           = ["https://www.googleapis.com/auth/calendar.readonly"]
 
 
+class CalendarAuthError(Exception):
+    """A user's Google credentials are missing/expired/revoked and need re-linking."""
+
+
 def _token_path_for(user_id: str) -> Path:
     return _TOKEN_DIR / f"google_token_{user_id}.json"
 
 
 # ── Credential management ─────────────────────────────────────────────────────
 
-def _get_credentials(user: dict) -> Credentials:
+def _get_credentials(user: dict, interactive: bool = False) -> Credentials:
     """
     Return valid OAuth credentials for a user, refreshing or re-authorising
     as necessary.
@@ -75,17 +84,20 @@ def _get_credentials(user: dict) -> Credentials:
     1. If user["google_token_path"] points to an existing file, load it.
     2. If the loaded credentials are expired but carry a refresh_token,
        refresh them silently via the Google token endpoint.
-    3. If no valid credentials are available, launch
-       InstalledAppFlow.run_local_server() — this opens a browser tab and
-       blocks until the user grants consent (Phase 1 manual onboarding).
+    3. If no valid credentials are available: when interactive=True, launch
+       InstalledAppFlow.run_local_server() (opens a browser tab and blocks
+       until consent); otherwise raise CalendarAuthError so unattended
+       callers (the scheduler) never hang waiting for a browser.
     4. Persist any updated credentials back to the token file.
     5. If a new token file was created and the user registry didn't know
        its path yet, update the registry.
 
     Args:
-        user: Full user dict from user_registry.get_user().
+        user:        Full user dict from user_registry.get_user().
+        interactive: Allow the browser consent flow (manual CLI only).
 
     Raises:
+        CalendarAuthError: credentials unusable and interactive=False.
         FileNotFoundError: if _CREDENTIALS_FILE is absent (downloaded from
             Google Cloud Console → APIs & Services → Credentials).
     """
@@ -117,6 +129,11 @@ def _get_credentials(user: dict) -> Credentials:
 
     # ── Step 3: full consent flow ─────────────────────────────────────────────
     if not creds or not creds.valid:
+        if not interactive:
+            raise CalendarAuthError(
+                "Google Calendar authorization expired or was revoked. "
+                "Re-link with: python -m personalassistant.agents.calendar_monitor"
+            )
         if not _CREDENTIALS_FILE.exists():
             raise FileNotFoundError(
                 f"Google client credentials not found: {_CREDENTIALS_FILE}\n"
@@ -151,6 +168,11 @@ def _get_credentials(user: dict) -> Credentials:
             )
 
     return creds
+
+
+# Users already DM'd about an expired token during this process (avoid spam
+# every 3 hours until they re-link).
+_auth_alerted: set[str] = set()
 
 
 # ── Calendar API fetch (wrapped by adapter) ───────────────────────────────────
@@ -226,7 +248,7 @@ def _raw_fetch_calendar(params: dict) -> dict:
 _adapter = DirectAPIAdapter(_raw_fetch_calendar)
 
 
-def _fetch_events(user: dict, lookahead_days: int) -> list[dict]:
+def _fetch_events(user: dict, lookahead_days: int, interactive: bool = False) -> list[dict]:
     """
     Resolve credentials for the user, then fetch and return their upcoming
     calendar events via the adapter.
@@ -234,12 +256,16 @@ def _fetch_events(user: dict, lookahead_days: int) -> list[dict]:
     Args:
         user:          Full user dict from user_registry.
         lookahead_days: Number of days ahead to query.
+        interactive:   Allow the browser consent flow (manual CLI only).
+
+    Raises:
+        CalendarAuthError: credentials unusable and interactive=False.
 
     Returns:
         List of normalised event dicts (event_id, title, start_time,
         end_time, location).  Empty list if no events found.
     """
-    creds  = _get_credentials(user)
+    creds  = _get_credentials(user, interactive=interactive)
     result = _adapter.fetch({"credentials": creds, "lookahead_days": lookahead_days})
     return result["events"]
 
@@ -255,8 +281,12 @@ def run() -> None:
       (User hasn't completed onboarding yet; not an error.)
     - Otherwise fetch their events using their calendar_lookahead_days and
       atomically replace their calendar_events rows in history_store.
-    - Any per-user error (API, auth, network) is caught and logged so a
-      single failure doesn't abort the whole cycle for other users.
+    - Any per-user error (API, auth, network) is caught, logged and recorded
+      via history_store.record_calendar_sync_error() so a single failure
+      doesn't abort the cycle for other users and the chat agent can tell
+      the user their schedule may be out of date.
+    - An expired/revoked Google token (CalendarAuthError) additionally DMs
+      the user once per process with re-link instructions.
     """
     users = user_registry.get_all_users()
     if not users:
@@ -292,17 +322,37 @@ def run() -> None:
                 "Calendar synced for user %s (%s): %d event(s) over next %d day(s)",
                 user_id, user["display_name"], len(events), lookahead,
             )
+        except CalendarAuthError as exc:
+            logger.error("Calendar auth problem for user %s: %s", user_id, exc)
+            history_store.record_calendar_sync_error(user_id, str(exc))
+            if user_id not in _auth_alerted:
+                _auth_alerted.add(user_id)
+                discord_notifier.send_alert(
+                    user_id,
+                    title="📅 Google Calendar needs re-linking",
+                    body=(
+                        "Your calendar authorization expired, so your schedule "
+                        "is no longer being updated.\n"
+                        "Re-link by running on the host: "
+                        "`python -m personalassistant.agents.calendar_monitor`"
+                    ),
+                )
         except FileNotFoundError as exc:
             logger.error("Missing Google credentials file: %s", exc)
+            history_store.record_calendar_sync_error(user_id, "Google client credentials file missing")
         except HttpError as exc:
             logger.error(
                 "Google Calendar API error for user %s: HTTP %s — %s",
                 user_id, exc.resp.status, exc.error_details,
             )
-        except Exception:
+            history_store.record_calendar_sync_error(
+                user_id, f"Google Calendar API error (HTTP {exc.resp.status})"
+            )
+        except Exception as exc:
             logger.exception(
                 "Unexpected error syncing calendar for user %s", user_id
             )
+            history_store.record_calendar_sync_error(user_id, f"Unexpected sync error: {exc}")
 
 
 # ── Alert helpers ─────────────────────────────────────────────────────────────
@@ -474,7 +524,7 @@ if __name__ == "__main__":
     print()
 
     try:
-        events = _fetch_events(user, user["calendar_lookahead_days"])
+        events = _fetch_events(user, user["calendar_lookahead_days"], interactive=True)
         if not events:
             print("No upcoming events found in this window.")
         else:
