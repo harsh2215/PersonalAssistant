@@ -1,15 +1,21 @@
 """
 stocks_monitor.py — Deterministic stock-price monitor. No LLM calls.
 
-Entry point:
-    run() — fetches quotes for every registered user's watchlist, logs
-    to history_store, fires alerts via discord_notifier when a threshold
-    is crossed, and resets alert state when price returns to normal range.
+Entry points:
+    run(snapshot_only=False) — fetches quotes for every registered user's
+    watchlist, logs to history_store, fires alerts via discord_notifier when
+    a threshold is crossed, and resets alert state when price returns to
+    normal range.
+    fetch_quotes(tickers)    — latest quotes via the adapter; also used by
+    chat_agent's get_latest_quote tool.
 
 Market-hours gate:
     is_market_open() is called at the top of run(). If the market is
     closed (outside Mon–Fri 09:15–15:30 IST) the function logs and
-    returns immediately without making any HTTP requests.
+    returns immediately without making any HTTP requests — unless
+    snapshot_only=True (used for the startup pass), in which case prices
+    are fetched and stored (the last close) but no alert is sent and no
+    alert state is touched.
 
 Adapter pattern:
     The Yahoo Finance chart API is never called inline inside run(). All
@@ -59,7 +65,7 @@ def is_market_open() -> bool:
     - Weekday: Monday–Friday only (weekday() 0–4).
     - Time: 09:15–15:29 IST (upper bound exclusive so 15:30 is closed).
 
-    Market holidays are not handled in Phase 1 — a holiday poll will
+    Market holidays are not handled — a holiday poll will
     simply find no price movement, which is acceptable.
     """
     now = datetime.now(_IST)

@@ -1,6 +1,6 @@
 """
-chat_agent.py — LLM-driven reasoning component. The only agent in Phase 1
-that makes Gemini API calls.
+chat_agent.py — LLM-driven reasoning component. The only agent that makes
+Gemini API calls.
 
 Public interface:
     ask(user_id: str, question: str) -> str
@@ -12,22 +12,31 @@ Grounding contract (non-negotiable):
     the model says so plainly.
 
 user_id threading:
-    Both tool implementations are closed over the user_id that entered ask().
-    It is structurally impossible for a tool call to query a different user's
-    rows — the dispatch function passes user_id directly to history_store.
+    Every tool implementation is a closure over the user_id (and user record)
+    that entered ask(). It is structurally impossible for a tool call to query
+    a different user's rows — the closures pass user_id directly to
+    history_store, and the model never supplies one.
+
+Current time:
+    The model has no clock, so ask() appends the current IST date/time to the
+    system instruction on every call, and calendar tools return times already
+    converted to IST. Calendar results also carry a warning when the last
+    calendar sync failed (history_store.calendar_sync) so stale data is
+    reported as stale rather than as "no events".
 
 Tools exposed to the model:
     get_watchlist()                    — the user's tracked tickers
     get_latest_quote(ticker)           — live quote (last close when market is closed)
     get_stock_history(ticker, days=7)  — queries history_store, capped at 30 days
-    get_upcoming_events(days=7)        — queries history_store, capped at the
-                                         user's calendar_lookahead_days setting
+    get_upcoming_events(days=7)        — IST calendar days incl. today, capped at
+                                         the user's calendar_lookahead_days;
+                                         reports when the last sync happened/failed
 
 Function-calling loop:
-    Send the user's question with tools attached → if the response contains
-    function_call parts, execute them, send function_response parts back →
-    repeat until the model returns a final text part (or MAX_TOOL_ROUNDS is
-    hit as a safety limit).
+    Handled by the google-genai SDK's automatic function calling (AFC) on a
+    chat session: the tool callables are passed in the config, the SDK runs
+    the model's function calls and feeds results back until the model returns
+    final text (the SDK caps this at 10 remote calls by default).
 
 SDK: google-genai (``pip install google-genai``).
 Model: gemini-3.1-flash-lite (see ``_MODEL_NAME``).
@@ -36,12 +45,13 @@ API key: GEMINI_API_KEY environment variable.
 
 import json
 import logging
+from datetime import datetime, timezone
 
 from google import genai
 from google.genai import types
 from personalassistant.agents import stocks_monitor
 from personalassistant.core import history_store, user_registry
-from personalassistant.core.config import GEMINI_API_KEY
+from personalassistant.core.config import GEMINI_API_KEY, IST
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +101,11 @@ TOOL USAGE PATTERNS:
 - For the CURRENT / latest price (especially if history is empty or the
   market is closed): call get_latest_quote(ticker). It reports whether the
   market is open; if closed, the price is the last close — say so.
+- For calendar / schedule questions ("today", "tomorrow", "this week"): call
+  get_upcoming_events(days) where days counts calendar days INCLUDING today
+  (days=1 → rest of today, days=2 → today + tomorrow). Use the current
+  date/time given below to decide which events belong to which day, present
+  times in IST, and mention if the result says the calendar may be out of date.
 - For a single stock question: call get_stock_history() directly with the
   ticker if the user specifies it, or call get_watchlist() first if the
   user says "my stocks" without naming one.
@@ -108,6 +123,73 @@ Response style:
 - If the user asks about a ticker not in their watchlist, say so and suggest
   they update their watchlist via the admin CLI.
 """.strip()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _system_instruction(now: datetime) -> str:
+    """Static instruction plus the current IST date/time (the model has no clock)."""
+    now_ist = now.astimezone(IST)
+    return (
+        f"{_SYSTEM_INSTRUCTION}\n\n"
+        f"CURRENT DATE/TIME: {now_ist:%A, %d %B %Y, %I:%M %p} IST (Asia/Kolkata). "
+        f"Resolve 'today', 'tomorrow' and weekday names against this, and always "
+        f"present times in IST."
+    )
+
+
+def _fmt_dt_ist(iso: str | None) -> str | None:
+    """ISO-8601 (any offset / Z) → 'Fri 20 Nov, 03:30 PM IST'; None if unparseable."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return f"{dt.astimezone(IST):%a %d %b, %I:%M %p} IST"
+
+
+def _format_event(ev: dict) -> dict:
+    """Shape a stored event for the model: IST times, weekday, all-day flag."""
+    start, end = ev["start_time"], ev.get("end_time") or ""
+    if "T" not in start:   # all-day: date strings, `end` is exclusive
+        start_d = datetime.strptime(start, "%Y-%m-%d")
+        out = {
+            "title": ev["title"],
+            "all_day": True,
+            "date": f"{start_d:%a %d %b %Y}",
+        }
+        if end and "T" not in end:
+            last = datetime.strptime(end, "%Y-%m-%d").date()
+            if (last - start_d.date()).days > 1:
+                out["through"] = f"{last.fromordinal(last.toordinal() - 1):%a %d %b %Y}"
+    else:
+        out = {
+            "title": ev["title"],
+            "all_day": False,
+            "start": _fmt_dt_ist(start) or start,
+            "end": _fmt_dt_ist(end) or end,
+        }
+    if ev.get("location"):
+        out["location"] = ev["location"]
+    return out
+
+
+def _sync_note(user_id: str) -> str | None:
+    """Human-readable warning when the calendar data may be stale or never synced."""
+    status = history_store.get_calendar_sync_status(user_id)
+    if status is None:
+        return "The calendar has never been synced for this user."
+    last_ok = _fmt_dt_ist(status.get("last_success_at"))
+    if status.get("last_error"):
+        return (
+            f"The latest calendar sync FAILED ({status['last_error']}). "
+            f"Data shown is from the last successful sync: {last_ok or 'never'}. "
+            f"It may be out of date — tell the user."
+        )
+    return None
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -201,25 +283,39 @@ def ask(user_id: str, question: str) -> str:
         return json.dumps({"watchlist": watchlist, "count": len(watchlist)})
 
     def get_upcoming_events(days: int = 7) -> str:
-        """Retrieve the user's upcoming calendar events from stored data synced from Google Calendar.
+        """Retrieve the user's upcoming calendar events (synced from Google Calendar), in IST.
 
         Args:
-            days: How many days ahead to look. Default 7. Capped at the user's configured calendar lookahead setting.
+            days: Number of IST calendar days to cover, INCLUDING today. days=1 is the
+                  rest of today, days=2 is today and tomorrow, days=7 is the next week.
+                  Default 7. Capped at the user's configured calendar lookahead setting.
         """
         max_days = user.get("calendar_lookahead_days", 10)
         clamped_days = min(max(int(days), 1), max_days)
 
         events = history_store.get_upcoming_events(user_id, clamped_days)
+        note = _sync_note(user_id)
         if not events:
-            return (
-                f"No upcoming events found in the next {clamped_days} day(s) for this user. "
-                f"Possible reasons: Google Calendar hasn't been linked yet, "
-                f"the calendar monitor hasn't run yet, or there are no events in this window."
+            msg = (
+                f"No events found in the next {clamped_days} calendar day(s) (today included) "
+                f"in the stored calendar."
             )
-        return json.dumps(events, default=str)
+            if note:
+                msg += f" NOTE: {note}"
+            else:
+                msg += " The last sync succeeded, so the calendar appears to be empty for this window."
+            return msg
+
+        result: dict = {
+            "window": f"next {clamped_days} calendar day(s), today included",
+            "events": [_format_event(e) for e in events],
+        }
+        if note:
+            result["warning"] = note
+        return json.dumps(result)
 
     config = types.GenerateContentConfig(
-        system_instruction=_SYSTEM_INSTRUCTION,
+        system_instruction=_system_instruction(datetime.now(timezone.utc)),
         tools=[get_watchlist, get_latest_quote, get_stock_history, get_upcoming_events],
         temperature=0.0,
     )

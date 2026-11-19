@@ -35,7 +35,7 @@ main.py ── APScheduler ──┬─ stocks_monitor     Mon–Fri, :00/:30, 9
 
 **Stocks:** For each user and ticker, the change vs. previous close is compared with the user's `alert_threshold_pct`. An alert is sent on the first crossing in a direction; further polls in the same direction are suppressed; when the price returns inside the band the state resets so the next crossing alerts again. On startup the monitor takes one price snapshot even if the market is closed (stored, no alerts), so the chat agent always has data. Market holidays are not handled (a holiday poll just sees no movement).
 
-**Calendar:** Every 15 minutes, the service checks stored events for any timed event starting within `CALENDAR_ALERT_LOOKAHEAD_MINUTES` (default 30 min). Alerts are deduplicated in SQLite (`calendar_alert_state`), ensuring each event triggers at most one Discord DM.
+**Calendar:** Events are synced every 3 hours (the chat agent answers from this stored copy, in IST; "today/tomorrow" are IST calendar days, and the agent is given the current date/time). Every 15 minutes, the service checks stored events for any timed event starting within `CALENDAR_ALERT_LOOKAHEAD_MINUTES` (default 30 min). Alerts are deduplicated in SQLite (`calendar_alert_state`), ensuring each event triggers at most one Discord DM.
 
 ## Setup
 
@@ -56,7 +56,7 @@ cp .env.example .env     # then fill in the values below
 
 **Discord:** in the Developer Portal → your bot → Bot → *Privileged Gateway Intents*, enable **Message Content Intent**. Users must share a server with the bot (or have DMs open) to receive DMs.
 
-**Google Calendar (optional):** create an OAuth *Desktop* client in Google Cloud Console (Calendar API enabled), download it to `config/google_credentials.json`. The first calendar run for each user opens a browser for consent; the token is cached in `data/` (both are gitignored).
+**Google Calendar (optional):** create an OAuth *Desktop* client in Google Cloud Console (Calendar API enabled), download it to `config/google_credentials.json`. Link each user once with `python -m personalassistant.agents.calendar_monitor` (opens a browser for consent; the token is cached in `data/`, both gitignored). The background service never opens a browser: if a token later expires or is revoked it records the failure, DMs the user once, and the chat agent warns that the schedule may be out of date until you re-link. **Note:** Google expires refresh tokens after 7 days while your OAuth consent screen is in *Testing* mode — set it to *In production* to avoid re-linking weekly.
 
 ## Usage
 

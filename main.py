@@ -18,7 +18,11 @@ Scheduler triggers:
     Sends near-event DMs from already-stored data; no Google API calls.
   - history cleanup      : cron, daily 03:00 IST.
 
-Both jobs use the Asia/Kolkata timezone so APScheduler's "next run time"
+Startup passes never open a browser: if a user's Google Calendar token is
+expired the calendar sync records the failure and DMs the user to re-link
+(python -m personalassistant.agents.calendar_monitor).
+
+All jobs use the Asia/Kolkata timezone so APScheduler's "next run time"
 display is meaningful at a glance.
 """
 
